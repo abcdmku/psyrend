@@ -1,0 +1,27 @@
+{
+  "name": "psyrend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Real-time WebGPU psychedelic audio visualizer with look-ahead music analysis",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify": "node scripts/verify.mjs"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "playwright": "^1.64.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@fontsource-variable/syne": "^5.3.0",
+    "@fontsource/special-gothic-expanded-one": "^5.3.0"
+  }
+}
