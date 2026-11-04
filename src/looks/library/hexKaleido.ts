@@ -10,7 +10,7 @@ const drive = new OverlayDrive();
  */
 export default defineLook({
   meta: { id: 'hex-kaleido',
-    remaps: true, name: 'Hex Kaleidoscope', weight: 0.4, energy: [0.3, 1], amount: [0.6, 0.9], genres: { techno: 0.8, edm: 0.7, ambient: 0.5 } },
+    remaps: true, pace: 0.55, name: 'Hex Kaleidoscope', weight: 0.4, energy: [0.3, 1], amount: [0.6, 0.9], genres: { techno: 0.8, edm: 0.7, ambient: 0.5 } },
   params(ctx, p) {
     const d = ctx.dna;
     const v = drive.update(ctx);

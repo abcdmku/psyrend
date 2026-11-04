@@ -129,12 +129,15 @@ export class Renderer {
   /** Each world's own paced clock (see SceneUpdateContext.clock). */
   private clocks = new Map<string, number>();
 
+  /** Clock-rate factor from the active look (LookMeta.pace scaled by its amount), eased. */
+  private lookPace = 1;
+
   /** Debug override for every world's clock rate (null = calibrated pace). */
   paceOverride: number | null = null;
 
   /** How fast a world's own clock runs: the song's weight times the world's calibration. */
   private pace(id: string, m: MusicState): number {
-    return this.paceOverride ?? worldPace(id, m.intensity);
+    return this.paceOverride ?? worldPace(id, m.intensity) * this.lookPace;
   }
 
   /** Advance a world's paced clock; starts at the song position the first time the world is drawn. */
@@ -230,6 +233,12 @@ export class Renderer {
     if (v.sceneB && !b) void this.ensureScene(v.sceneB);
     if (b === a) b = undefined;
     const transition = !!b && v.transProgress > 0 && v.transProgress < 1;
+    // A look that multiplies the image (kaleidoscopes) slows the worlds under it, eased in and out.
+    const lp = v.lookId && !this.rawScene ? (this.lookFactories.get(v.lookId)?.meta.pace ?? 1) : 1;
+    // The cue's own post kaleidoscope repeats the world the same way: half pace at full mix.
+    const lpT = (1 + (lp - 1) * Math.min(1, Math.max(0, v.lookAmount))) * (1 - 0.5 * Math.min(1, Math.max(0, v.post.kaleidoMix)));
+    this.lookPace += (lpT - this.lookPace) * (1 - Math.exp(-Math.max(0, dt) / 1.2));
+    Morph.calm = Math.min(1, this.lookPace) ** 0.8;
     const ctxBase = { music: m, time: wallTime, dt, intensity: v.intensity, travel: v.travel, spin: v.spin, evolve: v.evolve };
     const enc = device.createCommandEncoder({ label: 'frame' });
     const tsBegin = this.perf.timestampWrites('begin');

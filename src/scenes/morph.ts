@@ -156,6 +156,11 @@ export class Morph {
    * it, since a step moves a fixed distance however fast the clock runs, so calm songs react gently.
    */
   static pace = 1;
+  /**
+   * Reaction scale from the frame's look (1 = none), set by the renderer: a kaleidoscope repeats
+   * every event in each wedge, so the events it covers react more gently.
+   */
+  static calm = 1;
 
   /** Camera framing value j (fov, pitch, yaw, roll, height) for a phrase of this cue. */
   private camPick(j: number, key: number): number {
@@ -251,7 +256,7 @@ export class Morph {
     const stepK = Math.min(1.4, Math.max(0.5, Morph.pace)) ** 0.8;
     this.loud += (m.energySlow - this.loud) * (1 - Math.exp(-dt / 3));
     this.presence = 0.15 + 0.85 * smoothstep(0.25, 0.62, this.loud);
-    const pr = this.presence;
+    const pr = this.presence * Morph.calm;
     // Melody: each note turns the heading; the pitch class picks the plane, the interval the angle.
     if (m.lead > this.l + 0.02) {
       this.noteLevel = pr * level((m.lead - 0.4) / 0.6);

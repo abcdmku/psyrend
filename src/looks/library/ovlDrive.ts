@@ -42,6 +42,9 @@ export class OverlayDrive {
   pitch = 0;
   kicks = 0;
   bars = 0;
+  /** The bar counter eased over about a bar (for slow looks). */
+  slowBars = 0;
+  private fSlowBar = new Follow(2.2);
   private kickCount = 0;
   private prevKick = 0;
   private fE = new Follow(2.6);
@@ -64,6 +67,7 @@ export class OverlayDrive {
     this.pitch = this.fP.step(m.leadPitch, dt);
     this.kicks = this.fK.step(this.kickCount, dt, 3);
     this.bars = this.fBar.step(m.barIndex, dt, 2);
+    this.slowBars = this.fSlowBar.step(m.barIndex, dt, 2);
     this.flow += dt * (0.55 + 0.9 * this.energy);
     return this;
   }

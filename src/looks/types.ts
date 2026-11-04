@@ -49,6 +49,11 @@ export interface LookMeta {
    * set this; the rest stay available for pinning only.
    */
   overlay?: boolean;
+  /**
+   * Clock rate of the worlds under this look at full amount (default 1). Looks that repeat the image
+   * (kaleidoscopes) multiply how busy its motion reads, so they run the world slower.
+   */
+  pace?: number;
 }
 
 export interface LookContext {

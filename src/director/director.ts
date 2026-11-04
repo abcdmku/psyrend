@@ -509,7 +509,8 @@ export class Director {
     // The cue's own kaleidoscope slicing (chosen sparingly by the planner), eased in and out.
     p.kaleidoMix = e('kmix', st.kaleidoMix * kAllowed, 1.5);
     const impact = this.dropImpact(m);
-    p.kaleidoSpin = this.frame.spin * 0.6;
+    // A slow turn: every wedge repeats the motion, so the wheel itself only creeps.
+    p.kaleidoSpin = this.frame.spin * 0.2;
     p.bloomStrength = e('bloom', 0.55 + 0.3 * m.energySlow, 0.4) + 0.25 * drop;
     // Light pages (paper, vellum) must stay bright: auto-exposure would pull them to mid-grey.
     const bgId = (gB && fr.sceneB && fr.transProgress > 0.5 ? gB : gA)?.composition?.recipe.background;
@@ -626,7 +627,8 @@ function sampleGenome(sceneId: string, i: ChooseInput, naturalistic: boolean): G
   const style: CueStyle = {
     trailHalfLife: Math.max(0, (0.6 + 0.6 * psychedelic) * (0.05 + 0.4 * calm * rand()) + (s.kind === 'breakdown' ? 0.12 : 0)),
     kaleido: useKaleido ? [3, 4, 5, 6, 7, 8, 10, 12][Math.floor(rand() * 8)] : 0,
-    kaleidoMix: useKaleido ? 0.5 + rand() * 0.5 : 0,
+    // Nearly full: at half mix the unfolded world shows through, moving against its mirror image.
+    kaleidoMix: useKaleido ? 0.85 + rand() * 0.15 : 0,
     hueDrift: (rand() < 0.5 ? -1 : 1) * (0.05 + 0.6 * psychedelic * rand()),
     zoomRate: (rand() < 0.2 ? -0.5 : 1) * (0.02 + 0.14 * psychedelic * rand()) + (s.kind === 'build' ? 0.12 : 0),
     rotateRate: (rand() < 0.5 ? -1 : 1) * (0.01 + 0.1 * psychedelic * rand()),

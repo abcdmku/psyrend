@@ -9,6 +9,14 @@ import type { SceneFactory, SceneInstance, SceneMeta, SceneUpdateContext } from 
  * (near, mid, far), drifting past at different speeds; fibres keep growing in and receding at the
  * edges of slowly moving clumps, so the tangle is always re-forming and fresh wool keeps arriving.
  *
+ * Depth: each sheet is a gently bowed surface seen at an oblique angle (perspective per pixel: the
+ * view ray meets the sheet, see ef_toSim), so fibres converge and thin into the distance and loom
+ * large up close; which way the space recedes, how steeply and how deep the bow is glide slowly with
+ * the travel and the phrase framing. Each sheet's visible patch is fitted to its sim grid, so the
+ * burn stays within about one cell per pixel far away. Fibres are shaded as thin metal cylinders,
+ * the sheet in front casts soft shadows from its clumps on the one behind, haze deepens with true
+ * distance, and focus sits on the middle depth (near strands soft and large, far ones soft and hazy).
+ *
  * The music makes the wool and burns it. Every event grows a tuft of fresh fibre where it lands (a
  * growth field per sheet that thins away over many seconds), then sets it alight. The burn is an
  * excitable medium on a grid per sheet (heat, fuel, oxide, tag), stepped in a compute pass at a fixed
@@ -37,8 +45,16 @@ import type { SceneFactory, SceneInstance, SceneMeta, SceneUpdateContext } from 
 const NL = 3;
 const SW = 1152;
 const SH = 648;
-/** Sim cells per view height. */
-const K = 500;
+/** Largest tilt: h.v stays within -+HMAX over the screen. */
+const HMAX = 0.45;
+/** Share of the sim grid the visible patch of each sheet may fill (the rest is margin). */
+const FIT = 0.94;
+/** Depth of the bow: D rises by up to this much from the centre to the frame's corners. */
+const BOWL = 0.5;
+/** Sheet depths at the view centre (the near sheet at 1). */
+const DEPTH = [1, 1.65, 2.7];
+/** Extra magnification per sheet, so the near fibres loom larger than the fit alone would make them. */
+const NEAR_ZOOM = [0.7, 0.88, 0.82];
 const NP = 65536;
 const UVEC = 40;
 const TAU = Math.PI * 2;
@@ -67,17 +83,20 @@ const META: SceneMeta = {
  * Uniform layout (vec4 slots of U):
  *  0 h (sub-step), reset, frame, seed          1 burn rate, threshold, hot cooling, ember cooling
  *  2 fuel burn, oxide rate, regrowth, radiant  3 melody dir x, y, bias, ignition rate
- *  4-6 per sheet: floor(offset) x, y, fract(offset) x, y
- *  7-9 per sheet: shift x, y (this frame), rotation, cells per view unit
+ *  4-6 per sheet: grid origin (material cells) x, y, offset minus grid origin x, y
+ *  7-9 per sheet: shift x, y (this frame), rotation, cells per view unit at the centre
  *  10 warp z, density z, warp D1, warp D2       11 base angle, angle spread, density bias, oxide fade
- *  12-14 per sheet: spacing, half width px, brightness, noise slice
+ *  12-14 per sheet: spacing (cells), half width (cells), depth at the centre, noise slice
  *  15-26 ignitions (atlas x, y, age, strength) + (radius, tag, window, peak heat)
  *  27-28 snares (seed, age, strength, tag)
  *  29 sparks: emission, speed, size, centroid  30 -, -, -, frame dt
  *  31 drift sheet 0 (vx, vy), sheet 1 (vx, vy) 32 drift sheet 2 (vx, vy), gravity, -
  *  33 fire gain, steel lum, temper lum, glint   34 hue, light x, y, energy
  *  35 eased reactions: snare temper turn, note hue, note pull, note band height (view units)
+ *  36 fog per unit depth, bow c, shadow strength, shadow reach
  *  37 fibre crimp: long, short amplitude; short phase, long phase (the fine detail layer)
+ *  38 tilt h of sheet 0 (x, y), sheet 1 (x, y)  39 tilt h of sheet 2 (x, y), focal depth, blur
+ *     per unit of defocus (px at 1080p)
  */
 const HEAD = /* wgsl */ `
 const SW: i32 = ${SW};
@@ -90,6 +109,15 @@ const SNARE_PTS: i32 = ${SNARE_PTS};
 // The fibre field of one sheet at material position m (cells): four families of lines, each the
 // level sets of a direction field bent by two octaves of warp, so they curl, bunch and cross.
 struct EfPhi { phi: vec4f, along: vec4f, dens: vec4f };
+// The broad octave of a sheet's clump noise (q in material / 500).
+fn ef_clumpN(q: vec2f, l: i32) -> vec4f {
+  return noise4(vec3f(rot2(0.73 + f32(l) * 0.5) * q * 1.25 + vec2f(41.0, 13.0), U[12 + l].w + U[10].y + 21.0));
+}
+// How densely sheet l's fibres stand at material m, from its broad clumps (for soft shadows).
+fn ef_clump(m: vec2f, l: i32) -> f32 {
+  let n = ef_clumpN(m * (1.0 / 500.0), l);
+  return (0.72 * (0.65 * n.x + 0.35 * n.y)) * 1.7 + U[11].z;
+}
 fn ef_phi(m: vec2f, l: i32, boost: f32) -> EfPhi {
   let L = U[12 + l];
   let Fw = U[10];
@@ -97,7 +125,7 @@ fn ef_phi(m: vec2f, l: i32, boost: f32) -> EfPhi {
   let w1 = noise4(vec3f(rot2(1.1) * q * 1.3, L.w + Fw.x));
   let w2 = noise4(vec3f(q * 4.7 + vec2f(17.3, 5.1), L.w * 1.7 + Fw.x * 1.4 + 9.0));
   // Clumps: two octaves on rotated lattices, so the value noise's grid never shows as straight edges.
-  let dn = 0.72 * noise4(vec3f(rot2(0.73 + f32(l) * 0.5) * q * 1.25 + vec2f(41.0, 13.0), L.w + Fw.y + 21.0))
+  let dn = 0.72 * ef_clumpN(q, l)
     + 0.28 * noise4(vec3f(rot2(-0.41 + f32(l) * 0.9) * q * 2.9 + vec2f(5.0, 29.0), L.w * 1.3 + Fw.y * 1.5 + 3.0));
   var o: EfPhi;
   for (var k = 0; k < 4; k++) {
@@ -113,24 +141,45 @@ fn ef_phi(m: vec2f, l: i32, boost: f32) -> EfPhi {
 // Coverage of the fibres at a point, given each family's gradient per pixel (or per cell): crisp
 // lines of half-width hw that break into fibres of random length with tapered tips, present where
 // the clump density beats each fibre's own threshold (so fibres grow and recede as it moves).
-struct EfFib { cov: f32, tan: vec2f, br: f32 };
-fn ef_mask(P: EfPhi, gx: vec4f, gy: vec4f, ax: vec4f, ay: vec4f, hw: f32, l: i32, dense0: f32, dense1: f32) -> EfFib {
+// blur (px, at least 1) softens each line's edge for depth of field while keeping its total light.
+// Each fibre is shaded as a thin metal cylinder lit from the front (lit side, highlight, dark side),
+// blended over the fibres present by their coverage: dif (diffuse), spec (highlight), nz (how much
+// the surface faces the eye, for a burning strand's hot core); ctr is the offset (px) from the point
+// to the strongest fibre's centre line, where its colour is read (a soft edge keeps its own colour).
+struct EfFib { cov: f32, tan: vec2f, br: f32, dif: f32, spec: f32, nz: f32, ctr: vec2f };
+fn ef_mask(P: EfPhi, gx: vec4f, gy: vec4f, ax: vec4f, ay: vec4f, hw: f32, l: i32, dense0: f32, dense1: f32, blur: f32) -> EfFib {
   var o: EfFib;
   var keep = 1.0;
   var best = -1.0;
   o.tan = vec2f(1.0, 0.0);
   o.br = 0.5;
-  let db = U[11].z;
+  o.ctr = vec2f(0.0);
+  let L3 = normalize(vec3f(U[34].yz * 0.8, 0.6));
+  let H3 = normalize(L3 + vec3f(0.0, 0.0, 1.0));
+  // Thin fibres show their average shading; the cylinder resolves once they are a pixel or two wide.
+  let round = smoothstep(0.5, 1.6, hw);
+  var ws = 1e-4;
+  var dif = 0.0;
+  var spec = 0.0;
+  var nz = 0.0;
+  // The near sheet is a little sparser, so there are voids to look through into the depth.
+  let db = U[11].z + select(select(0.03, 0.0, l == 1), -0.1, l == 0);
   for (var k = 0; k < 4; k++) {
     let x = P.phi[k];
     let fk = f32(k + l * 4);
     // Each fibre sits off its slot by its own amount and crimps along its length with its own two
-    // wavelengths, so neighbours wander independently and cross. Nearest of the four in reach.
+    // wavelengths, so neighbours wander independently and cross. The strongest of the four in reach
+    // (not merely the nearest: a nearer fibre may be absent here, and a defocused one reaches wide).
     let xb = floor(x);
     let al = P.along[k];
-    var d = 9.0;
+    var c = 0.0;
+    var score = -9.0;
+    var sd = 0.0;
     var li = xb;
-    var slope = 0.0;
+    var seg = 0.0;
+    var gv = vec2f(gx[k], gy[k]);
+    var w = 0.0;
+    var B = 1.0;
     for (var j = -1; j <= 2; j++) {
       let lj = xb + f32(j);
       let h3 = hash33(vec3f(lj, fk, 7.7));
@@ -143,34 +192,61 @@ fn ef_mask(P: EfPhi, gx: vec4f, gy: vec4f, ax: vec4f, ay: vec4f, hw: f32, l: i32
       let p1 = al * f1 + h3.y * 40.0 + U[37].w * (0.5 + h3.z);
       let p2 = al * f2 + h3.z * 40.0 + U[37].z * (0.6 + 0.8 * h3.x);
       let off = 0.64 * (h3.z - 0.5) + a1 * sin(p1) + a2 * sin(p2);
-      let dj = abs(x - lj - off);
-      let near = dj < d;
-      d = min(d, dj);
-      li = select(li, lj, near);
-      slope = select(slope, a1 * f1 * cos(p1) + a2 * f2 * cos(p2), near);
+      let sj = x - lj - off;
+      let slope = a1 * f1 * cos(p1) + a2 * f2 * cos(p2);
+      let gvj = vec2f(gx[k] - slope * ax[k], gy[k] - slope * ay[k]);
+      let gj = max(length(gvj), 1e-5);
+      // Defocus spreads a fibre by at most about a third of the gap to the next, so blurred fibres
+      // stay distinct strands instead of merging into flat bands.
+      let Bj = clamp(blur, 1.0, max(1.0, 0.35 / gj));
+      // Its presence and taper only matter within reach (usually one of the four).
+      var wj = 0.0;
+      var sgj = 0.0;
+      if (abs(sj) / gj < hw + 0.5 * Bj + 0.5 || j == 0) {
+        let segL = 110.0 + 170.0 * hash12(vec2f(lj, fk + 3.1));
+        let aj = al / segL + hash12(vec2f(lj * 1.31, fk + 0.7));
+        sgj = floor(aj);
+        let fa = aj - sgj;
+        let th = mix(-0.5, 0.42, hash13(vec3f(lj, sgj, fk)));
+        let pres = smoothstep(th - 0.06, th + 0.06, P.dens[k] + db);
+        let taper = smoothstep(0.0, 0.16, min(fa, 1.0 - fa));
+        wj = hw * pres * taper;
+      }
+      let cj = clamp(min((wj + 0.5 * Bj - abs(sj) / gj) / Bj, 2.0 * wj / Bj), 0.0, 1.0);
+      let scj = cj - 1e-3 * abs(sj);
+      let take = scj > score;
+      score = max(score, scj);
+      c = select(c, cj, take);
+      sd = select(sd, sj, take);
+      li = select(li, lj, take);
+      seg = select(seg, sgj, take);
+      gv = select(gv, gvj, take);
+      w = select(w, wj, take);
+      B = select(B, Bj, take);
     }
-    let gv = vec2f(gx[k] - slope * ax[k], gy[k] - slope * ay[k]);
     let g = max(length(gv), 1e-5);
-    let segL = 110.0 + 170.0 * hash12(vec2f(li, fk + 3.1));
-    let a = P.along[k] / segL + hash12(vec2f(li * 1.31, fk + 0.7));
-    let seg = floor(a);
-    let fa = a - seg;
-    let h = hash13(vec3f(li, seg, fk));
-    let th = mix(-0.5, 0.42, h);
-    let pres = smoothstep(th - 0.06, th + 0.06, P.dens[k] + db);
-    let taper = smoothstep(0.0, 0.16, min(fa, 1.0 - fa));
-    let w = hw * pres * taper;
-    var c = clamp(min(w + 0.5 - d / g, 2.0 * w), 0.0, 1.0);
-    c = mix(c, min(2.0 * w * g, 1.0), smoothstep(dense0, dense1, g));
+    // Far too fine to resolve: the family's average coverage (the share of its fibres present).
+    let share = smoothstep(-0.56, 0.48, P.dens[k] + db);
+    c = mix(c, min(1.68 * hw * share * g, 1.0), smoothstep(dense0, dense1, g));
     let br = 0.3 + 0.7 * hash13(vec3f(li, seg, fk + 9.5));
     keep *= 1.0 - c;
     let sc = c * br;
     let tn = vec2f(-gv.y, gv.x) / g;
     o.tan = select(o.tan, tn, sc > best);
     o.br = select(o.br, br, sc > best);
+    o.ctr = select(o.ctr, -sd * gv / (g * g), sc > best);
+    let uk = clamp(sd / (g * max(w + 0.25 * (B - 1.0), 0.3)), -1.0, 1.0) * round;
+    let N3 = vec3f(gv / g * uk, sqrt(max(1.0 - uk * uk, 0.0)));
+    ws += sc;
+    dif += sc * (0.2 + 0.95 * max(dot(N3, L3), 0.0));
+    spec += sc * pow(max(dot(N3, H3), 0.0), 26.0);
+    nz += sc * N3.z;
     best = max(best, sc);
   }
   o.cov = 1.0 - keep;
+  o.dif = select(0.85, dif / ws, ws > 1e-3);
+  o.spec = select(0.0, spec / ws, ws > 1e-3) * smoothstep(0.4, 1.4, hw);
+  o.nz = select(0.8, nz / ws, ws > 1e-3);
   return o;
 }
 
@@ -179,7 +255,7 @@ fn ef_cellFib(m: vec2f, l: i32, boost: f32) -> EfFib {
   let P0 = ef_phi(m, l, boost);
   let Px = ef_phi(m + vec2f(1.0, 0.0), l, boost);
   let Py = ef_phi(m + vec2f(0.0, 1.0), l, boost);
-  return ef_mask(P0, Px.phi - P0.phi, Py.phi - P0.phi, Px.along - P0.along, Py.along - P0.along, 0.75, l, 0.3, 0.5);
+  return ef_mask(P0, Px.phi - P0.phi, Py.phi - P0.phi, Px.along - P0.along, Py.along - P0.along, 0.75, l, 0.3, 0.5, 1.0);
 }
 
 // A kick's tuft lies along the fibres: an ellipse stretched along one family's direction (picked
@@ -191,14 +267,31 @@ fn ef_tuft(q: vec2f, c: vec2f, l: i32) -> vec2f {
   return vec2f(dot(q, vec2f(-n.y, n.x)) / 2.0, dot(q, n) * 1.4);
 }
 
-// Sheet transform: view coords (height 1, y down) to sim texel coords of sheet l.
+// Sheet perspective: each sheet is a gently bowed surface seen at an oblique angle. The view ray
+// through v (height 1, y down, focal 1) meets sheet l at p = v / D(v), in units of its distance at
+// the view centre, with D = 1 + h.v + c v.v, and its depth there is Z / D: the fibres converge and
+// thin toward where h points away from, and the bow brings the frame's edges near, so the wool
+// recedes into the middle. The CPU's toMaterial is the same map.
+fn ef_h(l: i32) -> vec2f { return select(select(U[39].xy, U[38].zw, l == 1), U[38].xy, l == 0); }
+fn ef_den(v: vec2f, l: i32) -> f32 { return max(1.0 + dot(ef_h(l), v) + U[36].y * dot(v, v), 0.05); }
+fn ef_depth(v: vec2f, l: i32) -> f32 { return U[12 + l].z / ef_den(v, l); }
+// Sheet transform: view coords to sim texel coords of sheet l.
 fn ef_toSim(v: vec2f, l: i32) -> vec2f {
   let X = U[7 + l];
-  return rot2(X.z) * v * X.w + CENTRE + U[4 + l].zw;
+  return rot2(X.z) * (v / ef_den(v, l)) * X.w + CENTRE + U[4 + l].zw;
 }
+// The inverse: the plane's exact inverse, then Newton steps on v - p D(v) = 0 for the bow.
 fn ef_toView(s: vec2f, l: i32) -> vec2f {
   let X = U[7 + l];
-  return rot2(-X.z) * (s - CENTRE - U[4 + l].zw) / X.w;
+  let p = rot2(-X.z) * (s - CENTRE - U[4 + l].zw) / X.w;
+  let h = ef_h(l);
+  var v = p / max(1.0 - dot(h, p), 0.05);
+  for (var i = 0; i < 3; i++) {
+    let F = v - p * ef_den(v, l);
+    let gd = h + 2.0 * U[36].y * v;
+    v -= F + p * (dot(gd, F) / max(1.0 - dot(gd, p), 0.05));
+  }
+  return v;
 }
 // Temper colours of oxidised steel by oxide thickness: straw, bronze, violet, blue, teal, then the
 // second order (gold-green, magenta) and round again.
@@ -603,7 +696,11 @@ ${FULLSCREEN_VS}
   let look = U[33];
   let hue0 = U[34].x;
   let steel = ef_steel();
-  var col = vec3f(0.0);
+  let Dp = U[36];
+  let rs = F.res.y / 1080.0;
+  let haze = palL(hue0 + 0.6, 0.012) + vec3f(0.002, 0.003, 0.005);
+  // Deep behind the far sheet, a faint haze where the space recedes.
+  var col = haze * 0.4 * smoothstep(1.8, 5.5, ef_depth(v, 2));
   for (var l = 2; l >= 0; l--) {
     let s = ef_toSim(v, l);
     let m = s + U[4 + l].xy;
@@ -615,12 +712,25 @@ ${FULLSCREEN_VS}
     let ax = dpdx(P.along);
     let ay = dpdy(P.along);
     let L = U[12 + l];
-    let fib = ef_mask(P, gx, gy, ax, ay, L.y, l, 0.22, 0.45);
+    // Perspective: fibre width is set in cells, so near fibres are thick and far ones hairline.
+    let sx = dpdx(s);
+    let sy = dpdy(s);
+    let cpp = sqrt(max(abs(sx.x * sy.y - sx.y * sy.x), 1e-6));
+    let hwpx = clamp(L.y / cpp, 0.3, 6.0 * rs);
+    // Depth of field: sharp at the focal depth, soft in front of it and behind.
+    let dep = ef_depth(v, l);
+    let blur = 1.0 + U[39].w * rs * abs(1.0 - U[39].z / dep);
+    let fib = ef_mask(P, gx, gy, ax, ay, hwpx, l, 0.22, 0.45, blur);
     let edge = smoothstep(0.0, 24.0, min(min(s.x, f32(SW) - s.x), min(s.y, f32(SH) - s.y)));
     // The cells' shaded colours, B-spline filtered and normalised by their filtered fibre coverage
-    // (falling back to plain steel where the grid has no fibre nearby).
-    let A = ef_bspline(surfA, auv);
-    let B = ef_bspline(surfB, auv);
+    // (falling back to plain steel where the grid has no fibre nearby), read on the fibre's centre
+    // line so a soft, defocused edge carries the fibre's own colour.
+    let cp = fib.ctr * min(1.0, 6.0 * rs / max(length(fib.ctr), 1e-4));
+    let scC = s + sx * cp.x + sy * cp.y;
+    let sc2 = vec2f(clamp(scC.x, 0.5, f32(SW) - 0.5), clamp(scC.y, 0.5, f32(SH) - 0.5));
+    let cuv = vec2f(sc2.x / f32(SW), (sc2.y + f32(l * SH)) / f32(SH * NL));
+    let A = ef_bspline(surfA, cuv);
+    let B = ef_bspline(surfB, cuv);
     let eps = 0.04;
     let wsum = max(B.a, 0.0) + eps;
     // Each snare turns the temper colours a step round the wheel; a melody note pulls a broad band,
@@ -636,13 +746,24 @@ ${FULLSCREEN_VS}
     let glint = pow(abs(dot(vec2f(-fib.tan.y, fib.tan.x), Ld)), 28.0) * fib.br;
     // Glints on bare steel take the steel's tint, so the sparkle stays coloured rather than white.
     let gc = mix(vec3f(1.0, 0.97, 0.92), ef_hue(hue0 + 0.55 + U[35].x * 0.16), 0.7) * (1.0 - 0.6 * tAmt) + 1.2 * max(S - steel * (1.0 - tAmt), vec3f(0.0));
-    var base = S * (0.45 + 0.55 * fib.br);
-    base += gc * glint * look.w;
-    let lc = (base + fire) * L.z * edge;
-    // Depth: the far sheets sit in a faint haze of the shadow hue.
-    let fog = select(select(0.0, 0.35, l == 1), 0.65, l == 2);
-    let lcf = mix(lc, lc * vec3f(0.4, 0.5, 0.75) + palL(hue0 + 0.6, 0.003), fog);
-    col = col * (1.0 - fib.cov * 0.85) + lcf * fib.cov;
+    // Volume: each fibre shaded as a cylinder across its width.
+    var base = S * fib.dif * (0.45 + 0.55 * fib.br);
+    base += gc * (glint * look.w * (0.4 + 0.6 * fib.dif) + fib.spec * 0.45 * fib.br);
+    // A burning strand glows hottest along its core.
+    let core = 0.75 + 0.35 * fib.nz;
+    // Shadows: the sheet just in front, seen toward the light, shades this one where its clumps
+    // are dense (a soft shadow: at this distance single fibres blur away into their clumps).
+    var shade = 1.0;
+    if (l > 0) {
+      let vs = v - Ld * Dp.w * (U[12 + l].z - U[11 + l].z);
+      shade = 1.0 - Dp.z * smoothstep(-0.35, 0.55, ef_clump(ef_toSim(vs, l - 1) + U[3 + l].xy, l - 1));
+    }
+    let lc = (base * shade + fire * core) * edge;
+    // Atmosphere by true distance: dimmer, bluer and hazier the deeper the fibre lies.
+    let fog = 1.0 - exp(-max(dep - 0.85, 0.0) * Dp.x);
+    let lcf = mix(lc, lc * vec3f(0.35, 0.45, 0.7) * 0.75 + haze * 1.5, fog);
+    // Near sheets hide what lies behind them, but their gaps open onto the depth.
+    col = col * (1.0 - fib.cov * select(0.7, 0.92, l == 0)) + lcf * fib.cov;
   }
   return vec4f(col, 1.0);
 }
@@ -657,7 +778,8 @@ struct SOut { @builtin(position) pos: vec4f, @location(0) q: vec2f, @location(1)
   let res = F.res;
   let a = s.p.xy * res.y;
   let b = (s.p.xy - s.p.zw * 0.05) * res.y;
-  let depth = select(select(0.55, 0.75, l == 1), 1.0, l == 0);
+  // Perspective: sparks near the eye are larger and brighter, far ones small and faint.
+  let depth = clamp(1.1 / ef_depth(s.p.xy, l), 0.3, 1.5);
   let sizePx = (0.7 + 0.5 * U[29].z) * depth * select(1.0, 0.8, ember) * res.y / 1080.0 + 0.35;
   var dir = a - b;
   let len = min(length(dir), 120.0);
@@ -727,6 +849,12 @@ class EmberInstance implements SceneInstance {
   private melDir: [number, number] = [1, 0];
   private readonly off = new Float64Array(NL * 2);
   private readonly floorOff = new Float64Array(NL * 2);
+  /** Per sheet: tilt h (x, y), cells per view unit at the centre, grid window centre (cells). */
+  private readonly h = new Float64Array(NL * 2);
+  private readonly ks = new Float64Array(NL);
+  /** Bow of the sheets (c in D = 1 + h.v + c v.v). */
+  private bowl = 0;
+  private readonly bias = new Float64Array(NL * 2);
   private kicks: Ign[] = [];
   private notes: Ign[] = [];
   private snares: { seed: number; age: number; strength: number; tag: number }[] = [];
@@ -745,10 +873,72 @@ class EmberInstance implements SceneInstance {
     private readonly owned: (GPUTexture | GPUBuffer)[],
   ) {}
 
-  /** View point -> material position on sheet l (cells), using this frame's transform. */
+  /** View point -> material position on sheet l (cells), using this frame's transform (as ef_toSim). */
   private toMaterial(vx: number, vy: number, l: number, rot: number): [number, number] {
-    const [rx, ry] = rotate(vx, vy, rot);
-    return [rx * K + SW / 2 + this.off[l * 2], ry * K + SH / 2 + this.off[l * 2 + 1]];
+    const den = this.den(vx, vy, l);
+    const [rx, ry] = rotate(vx / den, vy / den, rot);
+    return [rx * this.ks[l] + SW / 2 + this.off[l * 2], ry * this.ks[l] + SH / 2 + this.off[l * 2 + 1]];
+  }
+
+  /** The perspective divisor D(v) of sheet l (as ef_den). */
+  private den(vx: number, vy: number, l: number): number {
+    return Math.max(1 + this.h[l * 2] * vx + this.h[l * 2 + 1] * vy + this.bowl * (vx * vx + vy * vy), 0.05);
+  }
+
+  /**
+   * The camera: each sheet's tilt (h: which way it recedes and how steeply), its scale (cells per
+   * view unit at the centre) and where its grid window sits, so the whole visible, foreshortened
+   * patch of the plane fits its sim grid. All of it follows slow, steady inputs and the phrase
+   * framing (springs), so the view glides and never snaps.
+   */
+  private frameCamera(mo: Morph, g: readonly number[], rots: number[]): void {
+    // Fitted for at least 16:9, so a narrower warm-up or preview frame keeps the same camera.
+    const a = Math.max(this.aspect, 16 / 9);
+    const c = mo.cam;
+    const tr = mo.travel;
+    // The receding direction turns slowly all the way round; the framing's yaw and pitch lean on it.
+    const phi = g[6] * TAU + tr * 0.035 + 0.7 * Math.sin(tr * 0.051 + g[2] * 4) + 1.2 * c.yaw;
+    const amt = Math.min(1, Math.max(0.45, 0.78 + 0.18 * Math.sin(tr * 0.083 + g[5] * 6) + 0.5 * c.pitch));
+    // The bow (edges near, middle far) breathes slowly between gentle and deep, never flat.
+    const r2 = (a * a) / 4 + 0.25;
+    this.bowl = (BOWL * (0.55 + 0.35 * Math.sin(tr * 0.061 + g[3] * 5) - 0.25 * c.pitch)) / r2;
+    // Zoom from the framing's height: closer in only (the fit is the widest view the grid allows).
+    const zoom = 0.93 + 0.06 * Math.tanh(c.height);
+    for (let l = 0; l < NL; l++) {
+      // The sheets are not quite parallel: each leans a little its own way, and that slowly changes.
+      const pl = phi + (l - 1) * 0.3 * Math.sin(tr * 0.043 + g[7] * 5 + l);
+      const cx = Math.cos(pl);
+      const cy = Math.sin(pl);
+      // Keep 1 + h.v >= 1 - HMAX over the whole screen, so magnification and minification stay bounded.
+      const reach = 0.5 * Math.abs(cy) + 0.5 * a * Math.abs(cx);
+      const hm = (HMAX * amt * (1 + 0.06 * (1 - l))) / reach;
+      const hx = cx * hm;
+      const hy = cy * hm;
+      this.h[l * 2] = hx;
+      this.h[l * 2 + 1] = hy;
+      // Fit: the frame's outline on the sheet (the map is monotonic out from the centre, so the
+      // outline bounds the whole visible patch).
+      let x0 = Infinity;
+      let x1 = -Infinity;
+      let y0 = Infinity;
+      let y1 = -Infinity;
+      for (let i = 0; i < 64; i++) {
+        const t = ((i % 16) / 16) * 2 - 1;
+        const e = i >> 4;
+        const vx = (e === 0 ? t : e === 1 ? 1 : e === 2 ? -t : -1) * (a / 2);
+        const vy = (e === 0 ? -1 : e === 1 ? t : e === 2 ? 1 : -t) * 0.5;
+        const den = this.den(vx, vy, l);
+        const [px, py] = rotate(vx / den, vy / den, rots[l]);
+        x0 = Math.min(x0, px);
+        x1 = Math.max(x1, px);
+        y0 = Math.min(y0, py);
+        y1 = Math.max(y1, py);
+      }
+      const k = Math.min((SW * FIT) / (x1 - x0), (SH * FIT) / (y1 - y0)) * zoom * NEAR_ZOOM[l];
+      this.ks[l] = k;
+      this.bias[l * 2] = ((x0 + x1) / 2) * k;
+      this.bias[l * 2 + 1] = ((y0 + y1) / 2) * k;
+    }
   }
 
   update(ctx: SceneUpdateContext): void {
@@ -792,29 +982,31 @@ class EmberInstance implements SceneInstance {
     // Flow: each sheet drifts gently at its own pace along a slowly turning heading (parallax), and the
     // whole view turns slowly.
     // Steady inputs only (travel never steps on a beat), so the view never lurches with the drums.
-    const rotG = 0.06 * Math.sin(mo.travel * 0.12 + g[7] * TAU);
+    const rotG = 0.06 * Math.sin(mo.travel * 0.12 + g[7] * TAU) + 0.15 * mo.cam.roll;
     const rots = [0, 1, 2].map((l) => rotG * (1 + 0.25 * l) + (l - 1) * 0.02);
+    this.frameCamera(mo, g, rots);
     const head = g[1] * TAU + 0.6 * Math.sin(mo.travel * 0.07 + g[6] * 5);
     const dTravel = seek ? 0 : dt * 0.13 * mo.flow * (0.85 + 0.3 * e);
-    const spd = [30, 19, 11];
+    // Drift speeds in view units at the centre: true parallax, the near sheet much faster.
+    const spd = [0.064, 0.034, 0.017];
     const shift: number[] = [];
     const drift: number[] = [];
     for (let l = 0; l < NL; l++) {
-      const vx = Math.cos(head) * spd[l];
-      const vy = Math.sin(head) * spd[l] * 0.6;
-      const f0x = Math.floor(this.off[l * 2]);
-      const f0y = Math.floor(this.off[l * 2 + 1]);
+      const k = this.ks[l];
+      const vx = Math.cos(head) * spd[l] * k;
+      const vy = Math.sin(head) * spd[l] * k * 0.6;
       this.off[l * 2] += vx * dTravel;
       this.off[l * 2 + 1] += vy * dTravel;
-      const f1x = Math.floor(this.off[l * 2]);
-      const f1y = Math.floor(this.off[l * 2 + 1]);
-      shift.push(seek ? 0 : f1x - f0x, seek ? 0 : f1y - f0y);
+      // The grid window follows the visible patch (whole cells, so the sim state just shifts).
+      const f1x = Math.floor(this.off[l * 2] + this.bias[l * 2]);
+      const f1y = Math.floor(this.off[l * 2 + 1] + this.bias[l * 2 + 1]);
+      shift.push(seek ? 0 : f1x - this.floorOff[l * 2], seek ? 0 : f1y - this.floorOff[l * 2 + 1]);
       this.floorOff[l * 2] = f1x;
       this.floorOff[l * 2 + 1] = f1y;
       // On screen the content moves against the offset.
       const rate = dt > 0 ? dTravel / dt : 0;
       const [sx, sy] = rotate(-vx * rate, -vy * rate, -rots[l]);
-      drift.push(sx / K, sy / K);
+      drift.push(sx / k, sy / k);
     }
 
     // Events. Every ignition is born having aged one frame.
@@ -835,10 +1027,11 @@ class EmberInstance implements SceneInstance {
       const lv = mo.kickLevel;
       const s = lv;
       const r = (55 + 25 * e) * (0.45 + 0.55 * lv);
-      // The same point on all three sheets, so it always finds wool at some depth.
+      // The same point on all three sheets, so it always finds wool at some depth (radii in cells,
+      // scaled by each sheet's cells per view unit so a fire keeps its size on screen).
       for (const l of [2, 1, 0]) {
         const [mx, my] = this.toMaterial(vx, vy, l, rots[l]);
-        this.kicks.unshift({ mx, my, layer: l, age: dt, strength: s, radius: r * [1, 0.8, 0.65][l], tag: kickTag, win: KICK_WIN, hot: 1.3 * lv });
+        this.kicks.unshift({ mx, my, layer: l, age: dt, strength: s, radius: r * [1, 0.8, 0.65][l] * (this.ks[l] / 500), tag: kickTag, win: KICK_WIN, hot: 1.3 * lv });
       }
     }
     if (live && mo.snareAge === 0) {
@@ -857,7 +1050,7 @@ class EmberInstance implements SceneInstance {
       const vy = -0.36 * pitch;
       const [mx, my] = this.toMaterial(vx, vy, 0, rots[0]);
       const nl = mo.noteLevel;
-      this.notes.unshift({ mx, my, layer: 0, age: dt, strength: nl, radius: (28 + 8 * e) * (0.5 + 0.5 * nl), tag: noteTag, win: NOTE_WIN, hot: 1.25 * nl });
+      this.notes.unshift({ mx, my, layer: 0, age: dt, strength: nl, radius: (28 + 8 * e) * (0.5 + 0.5 * nl) * (this.ks[0] / 500), tag: noteTag, win: NOTE_WIN, hot: 1.25 * nl });
     }
     this.kicks.length = Math.min(this.kicks.length, 4);
     this.notes.length = Math.min(this.notes.length, 2);
@@ -894,7 +1087,7 @@ class EmberInstance implements SceneInstance {
       u[28 + l * 4] = shift[l * 2];
       u[29 + l * 4] = shift[l * 2 + 1];
       u[30 + l * 4] = rots[l];
-      u[31 + l * 4] = K;
+      u[31 + l * 4] = this.ks[l];
     }
     // Fibre field: geometry fixed per cue (DNA), drifting very slowly; the clumps move with the morph,
     // so fibres grow in and recede all the time.
@@ -914,15 +1107,27 @@ class EmberInstance implements SceneInstance {
     u[45] = 0.42 + 0.42 * g[2];
     u[46] = -0.1 + 0.06 * Math.sin(at[4]);
     u[47] = 0.008;
-    const spacing = [11, 8, 6.5];
-    const hw = [1.2, 0.65, 0.42];
-    const bright = [1.0, 0.5, 0.26];
+    // Fibre spacing and half width in cells: on screen they shrink with depth through the perspective.
+    const spacing = [10, 7.5, 6];
+    const hw = [0.55, 0.36, 0.28];
     for (let l = 0; l < NL; l++) {
       u[48 + l * 4] = spacing[l] * (0.9 + 0.25 * g[5]);
       u[49 + l * 4] = hw[l];
-      u[50 + l * 4] = bright[l];
+      u[50 + l * 4] = DEPTH[l];
       u[51 + l * 4] = g[0] * 11 + l * 7.3;
     }
+    // Depth cues: fog per unit depth, -, shadow strength, shadow reach (view units per unit of gap).
+    u[144] = 0.5;
+    u[145] = this.bowl;
+    u[146] = 0.65;
+    u[147] = 0.03;
+    for (let l = 0; l < NL; l++) {
+      u[152 + l * 2] = this.h[l * 2];
+      u[153 + l * 2] = this.h[l * 2 + 1];
+    }
+    // Focus on the middle sheet's depth; blur (px at 1080p) per unit of defocus.
+    u[158] = DEPTH[1] * 0.95;
+    u[159] = 6;
     // Ignitions: atlas positions this frame.
     const put = (slot: number, w: Ign | undefined) => {
       const b = 60 + slot * 8;
